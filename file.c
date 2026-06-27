@@ -5,6 +5,7 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/mpage.h>
+#include <linux/page-flags.h>
 
 #include "bitmap.h"
 #include "simplefs.h"
@@ -63,6 +64,28 @@ static int simplefs_file_get_block(struct inode *inode,
             extent ? index->extents[extent - 1].ee_block +
                          index->extents[extent - 1].ee_len
                    : 0;
+        /* Drop any stale bdev-cache aliases over the newly allocated range.
+         * clean_bdev_aliases() only clears the dirty flag (so the bdev cache
+         * won't write back on our behalf). It leaves `uptodate` set, so a
+         * later sb_bread() would still return the cached (pre-allocation)
+         * content instead of going to disk where writepage put the new data.
+         * Explicitly clear `uptodate` on each cached BH in the range to
+         * force sb_bread to re-read from disk.
+         */
+        clean_bdev_aliases(sb->s_bdev, bno, SIMPLEFS_MAX_BLOCKS_PER_EXTENT);
+        {
+            int i;
+            for (i = 0; i < SIMPLEFS_MAX_BLOCKS_PER_EXTENT; i++) {
+                struct buffer_head *_bh =
+                    __find_get_block(sb->s_bdev, bno + i, sb->s_blocksize);
+                if (_bh) {
+                    lock_buffer(_bh);
+                    clear_buffer_uptodate(_bh);
+                    unlock_buffer(_bh);
+                    brelse(_bh);
+                }
+            }
+        }
     } else {
         bno = index->extents[extent].ee_start + iblock -
               index->extents[extent].ee_block;
@@ -508,9 +531,33 @@ static ssize_t simplefs_write(struct file *file,
     return bytes_write;
 }
 
+static int simplefs_mmap(struct file *file, struct vm_area_struct *vma)
+{
+    file_accessed(file);  // update atime
+
+    vma->vm_ops = &simplefs_file_vm_ops;
+    if (IS_DAX(file_inode(file)))  // check if direct access
+        vm_flags_set(vma, VM_HUGEPAGE);
+    return 0;
+}
+
+#if SIMPLEFS_AT_LEAST(5, 19, 0)
+/* Delegate to the generic helper. It calls simplefs_file_get_block per BH,
+ * submits I/O when blocks are mapped, zero-fills holes, marks the folio
+ * uptodate, and — critically — unlocks the folio in all paths. The previous
+ * hand-rolled version below never called folio_unlock(), which is why
+ * filemap_fault hung after read_folio returned for sparse pages.
+ */
+static int simplefs_read_folio(struct file *file, struct folio *folio)
+{
+    return block_read_full_folio(folio, simplefs_file_get_block);
+}
+#endif
+
 const struct address_space_operations simplefs_aops = {
 #if SIMPLEFS_AT_LEAST(5, 19, 0)
     .readahead = simplefs_readahead,
+    .read_folio = simplefs_read_folio,
 #else
     .readpage = simplefs_readpage,
 #endif
@@ -519,6 +566,11 @@ const struct address_space_operations simplefs_aops = {
 #endif
     .write_begin = simplefs_write_begin,
     .write_end = simplefs_write_end,
+    /* Required for buffer_head-backed filesystems. Without these, mmap
+     * writes crash in folio_mark_dirty() (calls a NULL .dirty_folio op).
+     */
+    .dirty_folio = block_dirty_folio,
+    .invalidate_folio = block_invalidate_folio,
 };
 
 const struct file_operations simplefs_file_ops = {
@@ -528,4 +580,76 @@ const struct file_operations simplefs_file_ops = {
     .write = simplefs_write,
     .llseek = generic_file_llseek,
     .fsync = generic_file_fsync,
+    .mmap = simplefs_mmap,
+};
+
+static vm_fault_t simplefs_file_fault(struct vm_fault *vmf)
+{
+    return filemap_fault(vmf);
+}
+
+static vm_fault_t simplefs_file_page_mkwrite(struct vm_fault *vmf)
+{
+    struct folio *folio = page_folio(vmf->page);
+    struct inode *inode = folio_mapping(folio)->host;
+    struct super_block *sb = inode->i_sb;
+    struct file *file = vmf->vma->vm_file;
+
+    sb_start_pagefault(sb);
+
+    folio_lock(folio);
+
+    if (unlikely(!folio_test_uptodate(folio))) {
+        folio_unlock(folio);
+        sb_end_pagefault(sb);
+        return VM_FAULT_NOPAGE;
+    }
+
+    if (!folio_buffers(folio)) {
+        create_empty_buffers(folio, sb->s_blocksize, 0);
+    }
+    struct buffer_head *bh = folio_buffers(folio);
+    do {
+        if (!buffer_mapped(bh)) {
+            sector_t iblock = (sector_t) folio->index
+                              << (PAGE_SHIFT - sb->s_blocksize_bits);
+            iblock += (bh - (struct buffer_head *) folio_buffers(folio));
+            simplefs_file_get_block(inode, iblock, bh, 1);
+            if (!buffer_mapped(bh)) {
+                folio_unlock(folio);
+                sb_end_pagefault(sb);
+                return VM_FAULT_SIGBUS;
+            }
+        }
+        bh = bh->b_this_page;
+    } while (bh != (struct buffer_head *) folio_buffers(folio));
+
+    loff_t page_start = vmf->pgoff << PAGE_SHIFT;
+    loff_t page_end = page_start + PAGE_SIZE;
+
+    if (page_end > inode->i_size) {
+        inode->i_size = page_end;
+        inode->i_blocks = DIV_ROUND_UP(inode->i_size, SIMPLEFS_BLOCK_SIZE) + 1;
+        mark_inode_dirty(inode);
+    }
+
+    file_update_time(file);
+
+    folio_mark_dirty(folio);
+
+    /* VM_FAULT_LOCKED means "I'm returning with the folio LOCKED, you
+     * (the caller) own the unlock." do_shared_fault → finish_fault /
+     * fault_dirty_shared_page will unlock it. Calling folio_unlock here
+     * would race with the caller's unlock: folio_unlock XORs the lock
+     * bit, so an extra unlock on an already-unlocked folio re-sets it,
+     * leaving the folio permanently locked → truncate hangs at unmount.
+     */
+    sb_end_pagefault(sb);
+
+    return VM_FAULT_LOCKED;
+}
+
+const struct vm_operations_struct simplefs_file_vm_ops = {
+    .fault = simplefs_file_fault,
+    .page_mkwrite = simplefs_file_page_mkwrite,
 };
