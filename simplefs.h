@@ -135,6 +135,7 @@ uint32_t simplefs_hash(struct dentry *dentry);
 extern const struct file_operations simplefs_file_ops;
 extern const struct file_operations simplefs_dir_ops;
 extern const struct address_space_operations simplefs_aops;
+extern const struct vm_operations_struct simplefs_file_vm_ops;
 
 /* extent functions */
 extern uint32_t simplefs_ext_search(struct simplefs_file_ei_block *index,
