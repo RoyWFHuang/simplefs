@@ -34,6 +34,11 @@ static int simplefs_file_get_block(struct inode *inode,
     bh_index = sb_bread(sb, ci->ei_block);
     if (!bh_index)
         return -EIO;
+    if (!simplefs_ei_block_csum_verify(bh_index)) {
+        pr_err("ei_block %u: checksum verification failed\n", ci->ei_block);
+        ret = -EFSCORRUPTED;
+        goto brelse_index;
+    }
     index = (struct simplefs_file_ei_block *) bh_index->b_data;
 
     extent = simplefs_ext_search(index, iblock);
@@ -330,6 +335,11 @@ static int simplefs_write_end(struct file *file,
 #endif
             goto end;
         }
+        if (!simplefs_ei_block_csum_verify(bh_index)) {
+            pr_err("ei_block %u: checksum verification failed\n", ci->ei_block);
+            brelse(bh_index);
+            goto end;
+        }
         index = (struct simplefs_file_ei_block *) bh_index->b_data;
 
         first_ext = simplefs_ext_search(index, inode->i_blocks - 1);
@@ -345,6 +355,7 @@ static int simplefs_write_end(struct file *file,
                        index->extents[i].ee_len);
             memset(&index->extents[i], 0, sizeof(struct simplefs_extent));
         }
+        simplefs_ei_block_csum_set(bh_index);
         mark_buffer_dirty(bh_index);
         brelse(bh_index);
     }
@@ -377,6 +388,12 @@ static int simplefs_open(struct inode *inode, struct file *filp)
         bh_index = sb_bread(inode->i_sb, SIMPLEFS_INODE(inode)->ei_block);
         if (!bh_index)
             return -EIO;
+        if (!simplefs_ei_block_csum_verify(bh_index)) {
+            pr_err("ei_block %u: checksum verification failed\n",
+                   SIMPLEFS_INODE(inode)->ei_block);
+            brelse(bh_index);
+            return -EFSCORRUPTED;
+        }
 
         ei_block = (struct simplefs_file_ei_block *) bh_index->b_data;
 
@@ -393,6 +410,7 @@ static int simplefs_open(struct inode *inode, struct file *filp)
         inode->i_size = 0;
         inode->i_blocks = 1;
 
+        simplefs_ei_block_csum_set(bh_index);
         mark_buffer_dirty(bh_index);
         brelse(bh_index);
         mark_inode_dirty(inode);
@@ -415,6 +433,14 @@ static ssize_t simplefs_read(struct file *file,
 
     /* find extent block */
     struct buffer_head *bh = sb_bread(sb, SIMPLEFS_INODE(inode)->ei_block);
+    if (!bh)
+        return -EIO;
+    if (!simplefs_ei_block_csum_verify(bh)) {
+        pr_err("ei_block %u: checksum verification failed\n",
+               SIMPLEFS_INODE(inode)->ei_block);
+        brelse(bh);
+        return -EFSCORRUPTED;
+    }
     struct simplefs_file_ei_block *ei_block =
         (struct simplefs_file_ei_block *) bh->b_data;
 
@@ -482,6 +508,12 @@ static ssize_t simplefs_write(struct file *file,
     struct buffer_head *bh = sb_bread(sb, SIMPLEFS_INODE(inode)->ei_block);
     if (!bh)
         return -EIO;
+    if (!simplefs_ei_block_csum_verify(bh)) {
+        pr_err("ei_block %u: checksum verification failed\n",
+               SIMPLEFS_INODE(inode)->ei_block);
+        brelse(bh);
+        return -EFSCORRUPTED;
+    }
     struct simplefs_file_ei_block *ei_block =
         (struct simplefs_file_ei_block *) bh->b_data;
 
@@ -540,6 +572,7 @@ static ssize_t simplefs_write(struct file *file,
         block_index = pos / SIMPLEFS_BLOCK_SIZE;
         ei_index = block_index / SIMPLEFS_MAX_BLOCKS_PER_EXTENT;
     }
+    simplefs_ei_block_csum_set(bh);
     mark_buffer_dirty(bh);
     sync_dirty_buffer(bh);
     brelse(bh);

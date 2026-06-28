@@ -18,6 +18,13 @@
 
 #define SIMPLEFS_FILENAME_LEN 255
 
+/* Checksum configurations */
+#define SIMPLEFS_CSUM_TAIL_SIZE \
+    8 /* Btrfs-style: type(2) + reserved(2) + csum(4) */
+
+#define SIMPLEFS_CSUM_TAIL_OFFSET \
+    (SIMPLEFS_BLOCK_SIZE - SIMPLEFS_CSUM_TAIL_SIZE)
+
 #define SIMPLEFS_FILES_PER_BLOCK \
     (SIMPLEFS_BLOCK_SIZE / sizeof(struct simplefs_file))
 #define SIMPLEFS_FILES_PER_EXT \
@@ -71,6 +78,13 @@ struct simplefs_inode {
 /* A 'container' structure that keeps the VFS inode and additional on-disk
  * data.
  */
+
+struct simplefs_block_csum_trailer {
+    uint16_t csum_type; /* Checksum type (1=CRC32c, 2=xxHash64) */
+    uint16_t csum_reserved;
+    uint32_t csum_value; /* 32-bit checksum value */
+};
+
 struct simplefs_inode_info {
     uint32_t ei_block; /* Block with list of extents for this file */
     char i_data[32];
@@ -87,6 +101,10 @@ struct simplefs_extent {
 struct simplefs_file_ei_block {
     uint32_t nr_files; /* Number of files in directory */
     struct simplefs_extent extents[SIMPLEFS_MAX_EXTENTS];
+    uint8_t csum_pad[SIMPLEFS_CSUM_TAIL_OFFSET - sizeof(uint32_t) -
+                     SIMPLEFS_MAX_EXTENTS * sizeof(struct simplefs_extent)];
+    struct simplefs_block_csum_trailer
+        csum_trailer; /* Btrfs-style checksum trailer */
 };
 
 struct simplefs_file {
@@ -98,7 +116,24 @@ struct simplefs_file {
 struct simplefs_dir_block {
     uint32_t nr_files;
     struct simplefs_file files[SIMPLEFS_FILES_PER_BLOCK];
+    uint8_t csum_pad[SIMPLEFS_CSUM_TAIL_OFFSET - sizeof(uint32_t) -
+                     SIMPLEFS_FILES_PER_BLOCK * sizeof(struct simplefs_file)];
+    struct simplefs_block_csum_trailer
+        csum_trailer; /* Btrfs-style checksum trailer */
 };
+
+/* The trailer must sit in the last 8 bytes of the 4 KiB block; the CRC
+ * covers everything before it ([0, SIMPLEFS_CSUM_TAIL_OFFSET)). */
+_Static_assert(offsetof(struct simplefs_file_ei_block, csum_trailer) ==
+                   SIMPLEFS_CSUM_TAIL_OFFSET,
+               "ei_block csum_trailer misplaced");
+_Static_assert(offsetof(struct simplefs_dir_block, csum_trailer) ==
+                   SIMPLEFS_CSUM_TAIL_OFFSET,
+               "dir_block csum_trailer misplaced");
+_Static_assert(sizeof(struct simplefs_file_ei_block) == SIMPLEFS_BLOCK_SIZE,
+               "ei_block must fill the block");
+_Static_assert(sizeof(struct simplefs_dir_block) == SIMPLEFS_BLOCK_SIZE,
+               "dir_block must fill the block");
 #if SIMPLEFS_AT_LEAST(6, 18, 0)
 struct simplefs_fs_context {
     u32 journal_dev;
@@ -121,6 +156,14 @@ int simplefs_parse_param(struct fs_context *fc, struct fs_parameter *param);
 int simplefs_init_inode_cache(void);
 void simplefs_destroy_inode_cache(void);
 struct inode *simplefs_iget(struct super_block *sb, unsigned long ino);
+
+/* csum.c — Btrfs-style block checksum trailer maintenance */
+void simplefs_ei_block_csum_set(struct buffer_head *bh);
+void simplefs_dir_block_csum_set(struct buffer_head *bh);
+int simplefs_ei_block_csum_verify(struct buffer_head *bh);
+int simplefs_dir_block_csum_verify(struct buffer_head *bh);
+void simplefs_set_new_dir_block_csum(struct buffer_head *bh);
+void simplefs_set_new_ei_block_csum(struct buffer_head *bh);
 
 /* dentry function */
 struct dentry *simplefs_mount(struct file_system_type *fs_type,

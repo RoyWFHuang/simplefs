@@ -22,15 +22,7 @@ static const struct inode_operations symlink_inode_ops;
         brelse(bh);             \
         bh = NULL;              \
     } while (0)
-/* Either return the inode that corresponds to a given inode number (ino), if
- * it is already in the cache, or create a new inode object if it is not in the
- * cache.
- *
- * Note that this function is very similar to simplefs_new_inode, except that
- * the requested inode is supposed to be allocated on-disk already. So do not
- * use this to create a completely new inode that has not been allocated on
- * disk.
- */
+
 struct inode *simplefs_iget(struct super_block *sb, unsigned long ino)
 {
     struct inode *inode = NULL;
@@ -150,6 +142,11 @@ static int __file_lookup(struct inode *dir,
     *ret_ei_bh = sb_bread(sb, ci_dir->ei_block);
     if (!*ret_ei_bh)
         return -EIO;
+    if (!simplefs_ei_block_csum_verify(*ret_ei_bh)) {
+        pr_err("ei_block %u: checksum verification failed\n", ci_dir->ei_block);
+        ret = -EFSCORRUPTED;
+        goto file_search_end;
+    }
     eblock = (struct simplefs_file_ei_block *) (*ret_ei_bh)->b_data;
     hash_code = simplefs_hash(dentry) %
                 (SIMPLEFS_MAX_EXTENTS * SIMPLEFS_MAX_BLOCKS_PER_EXTENT);
@@ -174,6 +171,10 @@ static int __file_lookup(struct inode *dir,
             }
 
             dblock = (struct simplefs_dir_block *) (*ret_bi_bh)->b_data;
+            if (!simplefs_dir_block_csum_verify(*ret_bi_bh)) {
+                ret = -EFSCORRUPTED;
+                goto file_search_end;
+            }
             /* Search file in ei_block */
             if (dblock->nr_files == 0) {
                 RELEASE_BUFFER_HEAD(*ret_bi_bh);
@@ -222,7 +223,6 @@ static struct dentry *simplefs_lookup(struct inode *dir,
         return ERR_PTR(-ENAMETOOLONG);
 
     /* Read the directory block on disk */
-
     chk = __file_lookup(dir, dentry, &ei, &bi, &fi, &ei_bh, &bi_bh);
     if (chk == -ENOENT)
         goto search_end; /* Not found, return NULL dentry */
@@ -434,6 +434,7 @@ static int simplefs_get_new_ext(struct super_block *sb,
         dblock = (struct simplefs_dir_block *) bh->b_data;
         memset(dblock, 0, sizeof(struct simplefs_dir_block));
         dblock->files[0].nr_blk = SIMPLEFS_FILES_PER_BLOCK;
+        simplefs_set_new_dir_block_csum(bh);
         mark_buffer_dirty(bh);
         RELEASE_BUFFER_HEAD(bh);
     }
@@ -553,6 +554,11 @@ static int simplefs_create(struct inode *dir,
         return -EIO;
 
     eblock = (struct simplefs_file_ei_block *) bh->b_data;
+    if (!simplefs_ei_block_csum_verify(bh)) {
+        pr_err("ei_block %u: checksum verification failed\n", ci_dir->ei_block);
+        ret = -EFSCORRUPTED;
+        goto end;
+    }
     /* Check if parent directory is full */
     if (eblock->nr_files == SIMPLEFS_MAX_SUBFILES) {
         ret = -EMLINK;
@@ -576,6 +582,9 @@ static int simplefs_create(struct inode *dir,
     }
     fblock = (char *) bh2->b_data;
     memset(fblock, 0, SIMPLEFS_BLOCK_SIZE);
+
+    simplefs_set_new_ei_block_csum(bh2);
+
     mark_buffer_dirty(bh2);
     RELEASE_BUFFER_HEAD(bh2);
 
@@ -603,7 +612,6 @@ static int simplefs_create(struct inode *dir,
         alloc = true;
     }
 
-    /* TODO: fix from 8 to dynamic value */
     /* Find which simplefs_dir_block has free space */
     bi = hash_code % eblock->extents[avail].ee_len;
     for (idx_bi = 0; idx_bi < eblock->extents[avail].ee_len; bi++, idx_bi++) {
@@ -615,6 +623,13 @@ static int simplefs_create(struct inode *dir,
             goto put_block;
         }
         dblock = (struct simplefs_dir_block *) bh2->b_data;
+        if (!simplefs_dir_block_csum_verify(bh2)) {
+            pr_err("dir_block %u: checksum verification failed\n",
+                   eblock->extents[avail].ee_start + bi);
+            RELEASE_BUFFER_HEAD(bh2);
+            ret = -EFSCORRUPTED;
+            goto put_block;
+        }
         if (dblock->nr_files != SIMPLEFS_FILES_PER_BLOCK)
             break;
         else
@@ -626,6 +641,8 @@ static int simplefs_create(struct inode *dir,
 
     eblock->extents[avail].nr_files++;
     eblock->nr_files++;
+    simplefs_dir_block_csum_set(bh2);
+    simplefs_ei_block_csum_set(bh);
     mark_buffer_dirty(bh2);
     mark_buffer_dirty(bh);
     RELEASE_BUFFER_HEAD(bh2);
@@ -668,6 +685,16 @@ end:
     return ret;
 }
 
+/* Remove the dentry's entry from its parent directory index.
+ * On success, *ret_ei is the extent index that held the entry and
+ * *ret_ei_bh holds the parent's ei_block buffer (released by the caller).
+ *
+ * The matching dir_block is csum_set + marked dirty here. The ei_block
+ * was mutated (nr_files--) but is NOT marked dirty here. The caller
+ * finishes its own ei_block mutations, then does csum_set ->
+ * mark_buffer_dirty exactly once, so the buffer never becomes dirty
+ * with a stale CRC.
+ */
 static int simplefs_remove_from_dir(struct inode *dir,
                                     struct dentry *dentry,
                                     int *ret_ei,
@@ -679,7 +706,7 @@ static int simplefs_remove_from_dir(struct inode *dir,
     struct simplefs_file_ei_block *eblock = NULL;
     struct simplefs_dir_block *dirblk = NULL;
     int ei = 0, bi = 0, idx_bi;
-    int ret = 0, found = false, dir_nr_files;
+    int ret = 0, dir_nr_files;
     uint32_t hash_code;
     /* Read parent directory index */
     *ret_ei_bh = sb_bread(sb, SIMPLEFS_INODE(dir)->ei_block);
@@ -687,6 +714,12 @@ static int simplefs_remove_from_dir(struct inode *dir,
         return -EIO;
 
     eblock = (struct simplefs_file_ei_block *) (*ret_ei_bh)->b_data;
+    if (!simplefs_ei_block_csum_verify(*ret_ei_bh)) {
+        pr_err("ei_block %u: checksum verification failed\n",
+               SIMPLEFS_INODE(dir)->ei_block);
+        ret = -EFSCORRUPTED;
+        goto end_ret;
+    }
     dir_nr_files = eblock->nr_files;
 
     hash_code = simplefs_hash(dentry) %
@@ -710,27 +743,34 @@ static int simplefs_remove_from_dir(struct inode *dir,
                 }
                 /* simplefs_dir_block */
                 dirblk = (struct simplefs_dir_block *) bh2->b_data;
+                if (!simplefs_dir_block_csum_verify(bh2)) {
+                    pr_err("dir_block %u: checksum verification failed\n",
+                           eblock->extents[ei].ee_start + bi);
+                    RELEASE_BUFFER_HEAD(bh2);
+                    ret = -EFSCORRUPTED;
+                    goto end_ret;
+                }
                 if (dirblk->nr_files == 0) {
                     RELEASE_BUFFER_HEAD(bh2);
                     continue;
                 }
                 if (simplefs_try_remove_entry(dirblk, eblock, ei, inode->i_ino,
                                               dentry->d_name.name)) {
+                    simplefs_dir_block_csum_set(bh2);
                     mark_buffer_dirty(bh2);
                     RELEASE_BUFFER_HEAD(bh2);
-                    found = true;
                     *ret_ei = ei;
-                    goto found_data;
+                    /* The ei_block was mutated (nr_files--) but is NOT
+                     * marked dirty here. The caller finishes its own
+                     * ei_block mutations, then does csum_set ->
+                     * mark_buffer_dirty */
+                    goto end_ret;
                 }
                 nr_bi_files -= dirblk->nr_files;
                 RELEASE_BUFFER_HEAD(bh2);
             }
         }
         bi = 0;
-    }
-found_data:
-    if (found) {
-        mark_buffer_dirty(*ret_ei_bh);
     }
 end_ret:
     return ret;
@@ -771,8 +811,9 @@ static int simplefs_unlink(struct inode *dir, struct dentry *dentry)
     if (!eblk->extents[ei].nr_files) {
         put_blocks(sbi, eblk->extents[ei].ee_start, eblk->extents[ei].ee_len);
         memset(&eblk->extents[ei], 0, sizeof(struct simplefs_extent));
-        mark_buffer_dirty(bh);
     }
+    simplefs_ei_block_csum_set(bh);
+    mark_buffer_dirty(bh);
     RELEASE_BUFFER_HEAD(bh);
 
     if (S_ISLNK(inode->i_mode))
@@ -810,6 +851,13 @@ static int simplefs_unlink(struct inode *dir, struct dentry *dentry)
     bh = sb_bread(sb, bno);
     if (!bh)
         goto clean_inode;
+    if (!simplefs_ei_block_csum_verify(bh)) {
+        /* Do not free blocks based on corrupt extents: leaking them is
+         * safer than corrupting the free bitmap. */
+        pr_err("ei_block %u: checksum verification failed\n", bno);
+        RELEASE_BUFFER_HEAD(bh);
+        goto clean_inode;
+    }
     eblk = (struct simplefs_file_ei_block *) bh->b_data;
     for (ei = 0; ei < SIMPLEFS_MAX_EXTENTS; ei++) {
         if (!eblk->extents[ei].ee_start)
@@ -824,13 +872,15 @@ static int simplefs_unlink(struct inode *dir, struct dentry *dentry)
                 continue;
             block = (char *) bh2->b_data;
             memset(block, 0, SIMPLEFS_BLOCK_SIZE);
+            simplefs_set_new_dir_block_csum(bh2);
             mark_buffer_dirty(bh2);
             RELEASE_BUFFER_HEAD(bh2);
         }
     }
 
-    /* Scrub index block */
+    /* Scrub index block: zeroed ei_block has a known CRC, no need to hash. */
     memset(eblk, 0, SIMPLEFS_BLOCK_SIZE);
+    simplefs_set_new_ei_block_csum(bh);
     mark_buffer_dirty(bh);
     RELEASE_BUFFER_HEAD(bh);
 
@@ -943,6 +993,7 @@ static int simplefs_rename(struct inode *src_dir,
         strncpy(dblock->files[fi].filename, dest_dentry->d_name.name,
                 SIMPLEFS_FILENAME_LEN - 1);
         dblock->files[fi].filename[SIMPLEFS_FILENAME_LEN - 1] = '\0';
+        simplefs_dir_block_csum_set(src_bi_bh);
         mark_buffer_dirty(src_bi_bh);
 
         RELEASE_BUFFER_HEAD(src_bi_bh);
@@ -967,7 +1018,10 @@ static int simplefs_rename(struct inode *src_dir,
             ret = -EIO;
             goto release_new;
         }
-        mark_buffer_dirty(dest_ei_bh);
+        /* Don't mark dirty here: the insert path below will csum_set +
+         * mark_dirty after it bumps nr_files. If insert fails and we
+         * unwind via put_block, the in-memory state is reverted to its
+         * pre-get_new_ext form so the on-disk CRC remains valid. */
         new_pos = 1;
     }
     /* copy src info into new directory */
@@ -980,6 +1034,13 @@ static int simplefs_rename(struct inode *src_dir,
             goto put_block;
         }
         dblock = (struct simplefs_dir_block *) dest_bi_bh->b_data;
+        if (!simplefs_dir_block_csum_verify(dest_bi_bh)) {
+            pr_err("dir_block %u: checksum verification failed\n",
+                   eblk_dest->extents[dest_ei].ee_start + bi);
+            RELEASE_BUFFER_HEAD(dest_bi_bh);
+            ret = -EFSCORRUPTED;
+            goto put_block;
+        }
 
         /* check if dir block is full*/
         if (dblock->nr_files != SIMPLEFS_FILES_PER_BLOCK) {
@@ -987,6 +1048,8 @@ static int simplefs_rename(struct inode *src_dir,
                                        dest_dentry->d_name.name);
             eblk_dest->extents[dest_ei].nr_files++;
             eblk_dest->nr_files++;
+            simplefs_dir_block_csum_set(dest_bi_bh);
+            simplefs_ei_block_csum_set(dest_ei_bh);
             mark_buffer_dirty(dest_bi_bh);
             mark_buffer_dirty(dest_ei_bh);
             /* Track that we inserted the file for cleanup on error */
@@ -1014,8 +1077,9 @@ static int simplefs_rename(struct inode *src_dir,
         put_blocks(sbi, eblk_src->extents[src_ei].ee_start,
                    eblk_src->extents[src_ei].ee_len);
         memset(&eblk_src->extents[src_ei], 0, sizeof(struct simplefs_extent));
-        mark_buffer_dirty(src_ei_bh);
     }
+    simplefs_ei_block_csum_set(src_ei_bh);
+    mark_buffer_dirty(src_ei_bh);
 
 update_metadata:
     /* Update new parent inode metadata */
@@ -1058,6 +1122,8 @@ rm_new:
         dblock = (struct simplefs_dir_block *) dest_bi_bh->b_data;
         if (simplefs_try_remove_entry(dblock, eblk_dest, dest_ei, src_in->i_ino,
                                       dest_dentry->d_name.name)) {
+            simplefs_dir_block_csum_set(dest_bi_bh);
+            simplefs_ei_block_csum_set(dest_ei_bh);
             mark_buffer_dirty(dest_bi_bh);
             mark_buffer_dirty(dest_ei_bh);
         } else { /* this should never happen */
@@ -1065,7 +1131,6 @@ rm_new:
                 "simplefs: failed to remove inserted entry on rename rollback "
                 "(leak)\n");
         }
-        RELEASE_BUFFER_HEAD(dest_bi_bh);
     }
 
 put_block:
@@ -1131,6 +1196,12 @@ static int simplefs_rmdir(struct inode *dir, struct dentry *dentry)
     bh = sb_bread(sb, SIMPLEFS_INODE(inode)->ei_block);
     if (!bh)
         return -EIO;
+    if (!simplefs_ei_block_csum_verify(bh)) {
+        pr_err("ei_block %u: checksum verification failed\n",
+               SIMPLEFS_INODE(inode)->ei_block);
+        RELEASE_BUFFER_HEAD(bh);
+        return -EFSCORRUPTED;
+    }
 
     eblock = (struct simplefs_file_ei_block *) bh->b_data;
     if (eblock->nr_files != 0) {
@@ -1162,6 +1233,11 @@ static int simplefs_link(struct dentry *src_dentry,
         return -EIO;
 
     eblock = (struct simplefs_file_ei_block *) bh->b_data;
+    if (!simplefs_ei_block_csum_verify(bh)) {
+        pr_err("ei_block %u: checksum verification failed\n", ci_dir->ei_block);
+        ret = -EFSCORRUPTED;
+        goto end;
+    }
     if (eblock->nr_files == SIMPLEFS_MAX_SUBFILES) {
         ret = -EMLINK;
         printk(KERN_INFO "directory is full");
@@ -1206,6 +1282,13 @@ static int simplefs_link(struct dentry *src_dentry,
         }
 
         dblock = (struct simplefs_dir_block *) bh2->b_data;
+        if (!simplefs_dir_block_csum_verify(bh2)) {
+            pr_err("dir_block %u: checksum verification failed\n",
+                   eblock->extents[avail].ee_start + bi);
+            RELEASE_BUFFER_HEAD(bh2);
+            ret = -EFSCORRUPTED;
+            goto put_block;
+        }
         if (dblock->nr_files != SIMPLEFS_FILES_PER_BLOCK)
             break;
         else
@@ -1216,6 +1299,8 @@ static int simplefs_link(struct dentry *src_dentry,
     simplefs_set_file_into_dir(dblock, old_inode->i_ino, dentry->d_name.name);
     eblock->extents[avail].nr_files++;
     eblock->nr_files++;
+    simplefs_dir_block_csum_set(bh2);
+    simplefs_ei_block_csum_set(bh);
     mark_buffer_dirty(bh2);
     mark_buffer_dirty(bh);
     RELEASE_BUFFER_HEAD(bh2);
@@ -1278,6 +1363,11 @@ static int simplefs_symlink(struct inode *dir,
         goto iput;
     }
     eblock = (struct simplefs_file_ei_block *) bh->b_data;
+    if (!simplefs_ei_block_csum_verify(bh)) {
+        pr_err("ei_block %u: checksum verification failed\n", ci_dir->ei_block);
+        ret = -EFSCORRUPTED;
+        goto iput;
+    }
 
     if (eblock->nr_files == SIMPLEFS_MAX_SUBFILES) {
         ret = -EMLINK;
@@ -1323,6 +1413,13 @@ static int simplefs_symlink(struct inode *dir,
         }
 
         dblock = (struct simplefs_dir_block *) bh2->b_data;
+        if (!simplefs_dir_block_csum_verify(bh2)) {
+            pr_err("dir_block %u: checksum verification failed\n",
+                   eblock->extents[avail].ee_start + bi);
+            RELEASE_BUFFER_HEAD(bh2);
+            ret = -EFSCORRUPTED;
+            goto put_block;
+        }
         if (dblock->nr_files != SIMPLEFS_FILES_PER_BLOCK)
             break;
         else
@@ -1334,6 +1431,8 @@ static int simplefs_symlink(struct inode *dir,
 
     eblock->extents[avail].nr_files++;
     eblock->nr_files++;
+    simplefs_dir_block_csum_set(bh2);
+    simplefs_ei_block_csum_set(bh);
     mark_buffer_dirty(bh2);
     mark_buffer_dirty(bh);
     RELEASE_BUFFER_HEAD(bh2);

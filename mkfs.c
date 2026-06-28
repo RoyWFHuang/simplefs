@@ -9,6 +9,8 @@
 #elif defined(__APPLE__)
 #include <libkern/OSByteOrder.h>
 #include <sys/disk.h> /* DKIOCGETBLOCKCOUNT and DKIOCGETBLOCKSIZE */
+#define htole16(x) OSSwapHostToLittleInt16(x)
+#define le16toh(x) OSSwapLittleToHostInt16(x)
 #define htole32(x) OSSwapHostToLittleInt32(x)
 #define le32toh(x) OSSwapLittleToHostInt32(x)
 #define htole64(x) OSSwapHostToLittleInt64(x)
@@ -24,6 +26,38 @@
 
 #include "simplefs.h"
 
+/* CRC32c implementation for checksum calculation */
+#ifdef __KERNEL__
+#include <linux/crc32c.h>
+#else
+/* CRC32c (Castagnoli polynomial 0x1EDC6F41, reflected: 0x82F63B78)
+ * Table-based implementation - matches kernel's crc32c() behavior.
+ */
+static uint32_t crc32c_table[256];
+static int crc32c_table_initialized = 0;
+
+static void init_crc32c_table(void)
+{
+    for (uint32_t i = 0; i < 256; i++) {
+        uint32_t c = i;
+        for (int j = 0; j < 8; j++)
+            c = (c & 1) ? (c >> 1) ^ 0x82F63B78 : c >> 1;
+        crc32c_table[i] = c;
+    }
+    crc32c_table_initialized = 1;
+}
+
+static uint32_t crc32c(uint32_t crc, const uint8_t *data, size_t length)
+{
+    if (!crc32c_table_initialized)
+        init_crc32c_table();
+
+    for (size_t i = 0; i < length; i++)
+        crc = crc32c_table[(crc ^ data[i]) & 0xff] ^ (crc >> 8);
+    return crc;
+}
+#endif
+
 struct superblock {
     union {
         struct simplefs_sb_info info;
@@ -31,7 +65,8 @@ struct superblock {
     };
 };
 
-_Static_assert(sizeof(struct superblock) == SIMPLEFS_BLOCK_SIZE);
+_Static_assert(sizeof(struct superblock) == SIMPLEFS_BLOCK_SIZE,
+               "superblock must be exactly one block");
 
 /**
  * DIV_ROUND_UP - round up a division
@@ -255,6 +290,23 @@ static int write_data_blocks(int fd, struct superblock *sb)
         return -1;
     }
 
+    /*
+     * BTRFS-style trailer sits in the last 8 bytes of the block; the CRC
+     * covers everything before it: [0, SIMPLEFS_CSUM_TAIL_OFFSET) = 4088 B.
+     */
+    const size_t csum_len = SIMPLEFS_CSUM_TAIL_OFFSET;
+
+    /* 8-byte trailer at block offset 4088 (SIMPLEFS_BLOCK_SIZE - 8) */
+    uint32_t csum = crc32c(~0U, (uint8_t *) buffer, csum_len);
+    /* Trailer: type (2 bytes) + reserved (2 bytes) + csum_value (4 bytes) */
+    uint16_t *type = (uint16_t *) (buffer + 4088);
+    uint16_t *reserved = (uint16_t *) (buffer + 4090);
+    uint32_t *value = (uint32_t *) (buffer + 4092);
+    *type = htole16(1); /* CSUM_TYPE_CRC32C */
+    *reserved = 0;
+    *value = htole32(csum);
+    printf("Root ei_block: CRC32c = 0x%08x\n", csum);
+
     ssize_t ret = write(fd, buffer, SIMPLEFS_BLOCK_SIZE);
     if (ret != SIMPLEFS_BLOCK_SIZE) {
         perror("Failed to write data block");
@@ -323,8 +375,8 @@ int main(int argc, char **argv)
     /* Verify if the file system image has sufficient size. */
     long int min_size = 100 * SIMPLEFS_BLOCK_SIZE;
     if (stat_buf.st_size < min_size) {
-        fprintf(stderr, "File is not large enough (size=%ld, min size=%ld)\n",
-                stat_buf.st_size, min_size);
+        fprintf(stderr, "File is not large enough (size=%lld, min size=%ld)\n",
+                (long long) stat_buf.st_size, min_size);
         ret = EXIT_FAILURE;
         goto fclose;
     }

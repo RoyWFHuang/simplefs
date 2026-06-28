@@ -40,6 +40,11 @@ static int simplefs_iterate(struct file *dir, struct dir_context *ctx)
     bh = sb_bread(sb, ci->ei_block);
     if (!bh)
         return -EIO;
+    if (!simplefs_ei_block_csum_verify(bh)) {
+        pr_err("ei_block %u: checksum verification failed\n", ci->ei_block);
+        brelse(bh);
+        return -EFSCORRUPTED;
+    }
     eblock = (struct simplefs_file_ei_block *) bh->b_data;
 
     if (ctx->pos - 2 == eblock->nr_files)
@@ -73,6 +78,14 @@ static int simplefs_iterate(struct file *dir, struct dir_context *ctx)
                 goto release_bh;
             }
             dblock = (struct simplefs_dir_block *) bh2->b_data;
+            if (!simplefs_dir_block_csum_verify(bh2)) {
+                pr_err("dir_block %u: checksum verification failed\n",
+                       eblock->extents[ei].ee_start + bi);
+                brelse(bh2);
+                bh2 = NULL;
+                ret = -EFSCORRUPTED;
+                goto release_bh;
+            }
 
             if (offset > dblock->nr_files) {
                 offset -= dblock->nr_files;
